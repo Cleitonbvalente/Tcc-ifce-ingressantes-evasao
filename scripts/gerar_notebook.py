@@ -73,15 +73,31 @@ import matplotlib.text as _mtext
 class _FormatoBR(mticker.ScalarFormatter):
     def __call__(self, x, pos=None):
         return super().__call__(x, pos).replace('.', ',')
-def aplicar_br(fig):
+def aplicar_br(fig, largura=1.0, relayout=True, rect=None, minimo=7.0):
+    # (1) vírgula decimal; (2) remove o título geral (a legenda da figura no TCC já o contém);
+    # (3) ajusta o tamanho das letras para o tamanho de impressão: a figura ocupa `largura` x 16 cm
+    #     no texto, e nenhum texto deve ficar abaixo de `minimo` pt depois da redução.
     for ax in fig.axes:
         for eixo in (ax.xaxis, ax.yaxis):
             if type(eixo.get_major_formatter()) is mticker.ScalarFormatter:
                 eixo.set_major_formatter(_FormatoBR())
+    if getattr(fig, '_suptitle', None) is not None:
+        fig._suptitle.remove(); fig._suptitle = None
+    k = fig.get_figwidth() / (6.3 * largura)          # polegadas da figura por polegada impressa
+    novo = lambda fs: max(fs * k * 0.8, minimo * k) if k > 1 else fs
+    for ax in fig.axes:
+        for eixo, nome in ((ax.xaxis, 'x'), (ax.yaxis, 'y')):
+            rot = eixo.get_ticklabels()
+            fs = rot[0].get_fontsize() if len(rot) else plt.rcParams['xtick.labelsize'] if isinstance(plt.rcParams['xtick.labelsize'], float) else 10
+            ax.tick_params(axis=nome, labelsize=novo(fs))
+    rotulos = {id(r) for ax in fig.axes for r in ax.get_xticklabels(which='both') + ax.get_yticklabels(which='both')}
     for t in fig.findobj(_mtext.Text):
         txt = t.get_text()
-        if txt:
+        if txt and id(t) not in rotulos:
             t.set_text(_re.sub(r'(?<=\d)\.(?=\d)', ',', txt))
+            t.set_fontsize(novo(t.get_fontsize()))
+    if relayout:
+        fig.tight_layout(rect=rect) if rect else fig.tight_layout()
 
 print('Versões utilizadas:')
 for nome, mod in [('python', sys), ('pandas', pd), ('numpy', np), ('scikit-learn', sklearn),
@@ -92,7 +108,7 @@ md(r"""
 > **Nota sobre versões.** Os números do TCC foram obtidos com Python 3.11 e as versões fixadas em `requirements.txt`
 > (scikit-learn 1.8.0, XGBoost 3.2.0, pandas 3.0.2, NumPy 2.4.4, SHAP 0.51.0). Para reprodução exata fora do Colab,
 > crie um ambiente com `pip install -r requirements.txt`. Hiperparâmetros: RF com 300 árvores; XGBoost com 300 árvores,
-> profundidade 4 e taxa 0,05; semente 42; *target encoding* com suavização 10. Versões diferentes
+> profundidade 4 e taxa 0,05; semente 42; *target encoding* temporal com suavização 10. Versões diferentes
 > podem alterar a terceira casa decimal dos resultados de *Random Forest* e XGBoost (a Regressão Linear e as
 > análises descritivas não dependem da versão). Nenhuma conclusão do trabalho depende dessas diferenças.
 """)
@@ -203,8 +219,9 @@ md(r"""
 ## 2. Engenharia de atributos e base de modelagem (Metodologia, Etapas 2, 3 e 5)
 
 Todas as *features* de série temporal aplicam `shift(1)` **antes** de qualquer média móvel, variação percentual ou
-acumulado: nenhuma usa informação do próprio ano da previsão. A variável `curso` recebe *target encoding* com
-*shrinkage* (peso 10), ajustado apenas no treino. As ofertas com menos de 4 anos de Ingressantes ficam fora da
+acumulado: nenhuma usa informação do próprio ano da previsão. A variável `curso` recebe *target encoding*
+**temporal**: a linha do ano $t$ é codificada com a média suavizada (peso 10) de ingressantes do mesmo curso nos anos
+**anteriores a $t$**, nas ofertas modeladas; curso sem histórico recebe a média geral desses anos (seção 15.2). As ofertas com menos de 4 anos de Ingressantes ficam fora da
 modelagem (continuam nas análises descritivas).
 """)
 code(r"""
@@ -237,7 +254,7 @@ def apply_target_encoding(d, col, mapa, media_global, nova):
 CATEGORICAS = ['campus', 'mod_curso', 'mod_ensino', 'area_cine']
 PREFIXOS = tuple(f'{c}_' for c in CATEGORICAS)
 
-# Blocos aninhados da ablação (Seção 5.8 do TCC)
+# Blocos aninhados da ablação (Seção 5.9 do TCC)
 BLOCO_A = ['ingressantes_lag1', 'ingressantes_lag2', 'ingressantes_ma3', 'ingressantes_cresc_pct']
 BLOCO_B = BLOCO_A + ['vagas_ofertadas_lag1', 'vagas_ofertadas_ma3', 'taxa_ocupacao_hist']
 BLOCO_C = BLOCO_B + ['matriculas_ativas_lag1', 'matriculas_ativas_ma3', 'concluintes_lag1', 'concluintes_ma3',
@@ -255,8 +272,8 @@ def construir_base(dados, min_anos=4):
     f['oferta_id'] = f['campus'] + ' | ' + f['curso'] + ' | ' + f['mod_curso'] + ' | ' + f['mod_ensino']
     return f.dropna(subset=['ingressantes_ma3']).copy(), hist
 
-def preparar(treino, teste):
-    # Target encoding do curso e one-hot das categóricas, ajustados só no treino.
+def preparar_original(treino, teste):
+    # Versão anterior (mantida para comparação, seção 15.2): target encoding ajustado em todas as linhas de treino.
     mapa, mg = fit_target_encoding(treino, 'curso', 'ingressantes')
     treino = apply_target_encoding(treino, 'curso', mapa, mg, 'curso_enc')
     teste = apply_target_encoding(teste, 'curso', mapa, mg, 'curso_enc')
@@ -264,6 +281,27 @@ def preparar(treino, teste):
     te = pd.get_dummies(teste, columns=CATEGORICAS, prefix=CATEGORICAS).reindex(columns=tr.columns, fill_value=0)
     dummies = [c for c in tr.columns if c.startswith(PREFIXOS)]
     return tr, te, dummies
+
+def te_temporal(d, hist=None, smoothing=10):
+    # Target encoding temporal: a linha do ano t usa só os ingressantes do mesmo curso nos anos < t (HIST_TE),
+    # suavizados em direção à média geral desses anos; curso sem nenhum ano anterior recebe a média geral (fallback).
+    hist = HIST_TE if hist is None else hist
+    out = pd.Series(np.nan, index=d.index); fallback = 0
+    for t in sorted(d.ano.unique()):
+        passado = hist[hist.ano < t]; m = d.ano == t
+        g = passado.ingressantes.mean()
+        est = passado.groupby('curso').ingressantes.agg(['mean', 'count'])
+        enc = (est['count'] * est['mean'] + smoothing * g) / (est['count'] + smoothing)
+        v = d.loc[m, 'curso'].map(enc); fallback += int(v.isna().sum())
+        out[m] = v.fillna(g).values
+    return out, fallback
+
+def preparar(treino, teste):
+    # One-hot das categóricas (colunas definidas no treino) e target encoding temporal do curso.
+    tr, te, dum = preparar_original(treino, teste)
+    tr, te = tr.copy(), te.copy()
+    tr['curso_enc'] = te_temporal(tr)[0].values; te['curso_enc'] = te_temporal(te)[0].values
+    return tr, te, dum
 
 def modelos():
     return {'Regressão Linear': LinearRegression(),
@@ -281,6 +319,8 @@ def metricas(y, p):
     return {'RMSE': mean_squared_error(y, p) ** 0.5, 'MAE': mean_absolute_error(y, p), 'R²': r2_score(y, p)}
 
 base, hist = construir_base(df)
+# Histórico usado pelo target encoding temporal: ingressantes de todos os anos das ofertas modeladas
+HIST_TE = df[df.oferta_id.isin(set(base.oferta_id))].dropna(subset=['ingressantes'])[['oferta_id', 'curso', 'ano', 'ingressantes']]
 ANO_CORTE = 2023
 treino, teste = base[base.ano <= ANO_CORTE].copy(), base[base.ano > ANO_CORTE].copy()
 TR, TE, DUMMIES = preparar(treino, teste)
@@ -366,33 +406,34 @@ code(r"""
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.3))
 for ax in (ax1, ax2):
     ax.grid(alpha=0.3)
-ax1.axvspan(2019.5, 2021.5, color='#f4b183', alpha=0.35, label='Período Covid-19 (2020-2021)')
+ax1.axvspan(2019.5, 2021.5, color='#f4b183', alpha=0.35, label='Período Covid-19 (2020–2021)')
 ax1.plot(por_ano.index, por_ano.evasao, 'o-', color='#c0392b', label='Evasão (contagem)')
-ax1.set_title('Evasão total por ano — IFCE (31 campi)'); ax1.set_xlabel('Ano'); ax1.set_ylabel('Nº de matrículas evadidas')
-ax1.legend(fontsize=8, loc='lower right')
-ax2.axvspan(2019.5, 2021.5, color='#9ecae1', alpha=0.4, label='Período Covid-19 (2020-2021)')
+ax1.set_title('(a) Evasão por ano (contagem)'); ax1.set_xlabel('Ano'); ax1.set_ylabel('Nº de matrículas evadidas')
+ax1.set_ylim(0, por_ano.evasao.max() * 1.08); ax1.legend(fontsize=8, loc='lower right')
+ax2.axvspan(2019.5, 2021.5, color='#9ecae1', alpha=0.4, label='Período Covid-19 (2020–2021)')
 ax2.plot(por_ano.index, por_ano['taxa_evasao_%'], 'o-', color='#2c7fb8', label='Taxa de evasão (%)')
-ax2.set_title('Taxa de evasão por ano (evasão / matrículas ativas)'); ax2.set_xlabel('Ano'); ax2.set_ylabel('Taxa de evasão (%)')
-ax2.legend(fontsize=8, loc='lower right')
+ax2.set_title('(b) Taxa de evasão por ano (%)'); ax2.set_xlabel('Ano'); ax2.set_ylabel('Taxa de evasão (%)')
+ax2.set_ylim(0, por_ano['taxa_evasao_%'].max() * 1.08); ax2.legend(fontsize=8, loc='lower right')
 fig.tight_layout(); aplicar_br(fig); fig.savefig(f'{PASTA_FIG}/fig_evasao_covid.png', dpi=200, facecolor='white'); plt.show()
 
 # Figura: ingressantes x evasão
-fig, axes = plt.subplots(1, 3, figsize=(15, 4.3))
+fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
 axes[0].axvspan(2019.5, 2021.5, color='#d9d9d9', alpha=0.6, label='Covid-19')
 axes[0].plot(por_ano.index, por_ano.ingressantes, 'o-', color='#2c7fb8', label='Ingressantes')
 axes[0].plot(por_ano.index, por_ano.evasao, 'o-', color='#c0392b', label='Evasão')
-axes[0].set_title('Ingressantes x Evasão por ano (IFCE)'); axes[0].set_xlabel('Ano'); axes[0].set_ylabel('Nº de matrículas'); axes[0].legend(fontsize=8)
+axes[0].set_title('(a) Ingressantes e evasão'); axes[0].set_xlabel('Ano'); axes[0].set_ylabel('Nº de matrículas'); axes[0].set_ylim(0, por_ano.ingressantes.max() * 1.08); axes[0].legend(fontsize=8, loc='lower left', ncol=3, columnspacing=0.8, handlelength=1.2)
 razao = por_ano.evasao / por_ano.ingressantes * 100
 axes[1].axvspan(2019.5, 2021.5, color='#d9d9d9', alpha=0.6)
 axes[1].plot(por_ano.index, razao, 'o-', color='#7b3294')
-axes[1].set_title('Evasão / Ingressantes do mesmo ano (%)'); axes[1].set_xlabel('Ano'); axes[1].set_ylabel('%')
+axes[1].set_title('(b) Evasão / ingressantes (%)'); axes[1].set_xlabel('Ano'); axes[1].set_ylabel('%')
 r_esc = stats.pearsonr(a.ingressantes, a.evasao)[0]
 axes[2].scatter(a.ingressantes, a.evasao, s=14, alpha=0.6, color='#e6550d')
 lim = max(a.ingressantes.max(), a.evasao.max())
 coef = np.polyfit(a.ingressantes, a.evasao, 1); xs = np.linspace(0, a.ingressantes.max(), 50)
 axes[2].plot(xs, np.polyval(coef, xs), 'k--', lw=1, label=f'r={r_esc:.2f}')
-axes[2].set_title('Por oferta (2016-2025): Ingressantes x Evasão totais'); axes[2].set_xlabel('Ingressantes (total 10 anos)'); axes[2].set_ylabel('Evasão (total 10 anos)'); axes[2].legend(fontsize=8)
+axes[2].set_title('(c) Totais por oferta'); axes[2].set_xlabel('Ingressantes (total 10 anos)'); axes[2].set_ylabel('Evasão (total 10 anos)'); axes[2].legend(fontsize=8)
 for ax in axes: ax.grid(alpha=0.3)
+for ax in axes[:2]: ax.set_xticks([2016, 2019, 2022, 2025])
 fig.tight_layout(); aplicar_br(fig); fig.savefig(f'{PASTA_FIG}/fig_evasao_ingressantes.png', dpi=200, facecolor='white'); plt.show()
 """)
 md(r"""
@@ -514,7 +555,7 @@ display(of4.sort_values('ocup_med').head(5)[['campus', 'curso', 'mod_curso', 'n'
 code(r"""
 # Figura: ocupação por ano e ocupação x evasão
 CORES_MOD = {'Bacharelado': '#2c7fb8', 'Licenciatura': '#d95f02', 'Tecnologia': '#1b9e77'}
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.0))
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.8))
 anos = sorted(obs.ano.unique()); gq = obs.groupby('ano').ocup
 med, q1, q3 = gq.median(), gq.quantile(.25), gq.quantile(.75)
 ok = [a for a in anos if a not in ANOS_INCONSISTENTES]; ruins = list(ANOS_INCONSISTENTES)
@@ -525,26 +566,26 @@ ax1.vlines(ruins, q1[ruins], q3[ruins], color='#8c8c8c', lw=6, alpha=0.35)
 ax1.plot(ruins, med[ruins], 'o', mfc='white', mec='#8c8c8c', mew=1.6, ms=7, label='Ano com inconsistência na fonte de vagas')
 ax1.annotate('2017: vagas registradas\n~3x acima dos anos vizinhos', xy=(2017, med[2017]), xytext=(2017.4, 0.12),
              fontsize=8, color='#595959', arrowprops=dict(arrowstyle='->', color='#8c8c8c', lw=0.8))
-ax1.annotate('2020: vagas de um único\nprocesso seletivo (provável)', xy=(2020, q3[2020]), xytext=(2016.2, 1.55),
+ax1.annotate('2020: vagas de um único\nprocesso seletivo (provável)', xy=(2020, med[2020]), xytext=(2016.2, 1.55),
              fontsize=8, color='#595959', arrowprops=dict(arrowstyle='->', color='#8c8c8c', lw=0.8))
 ax1.axvspan(2021.5, 2025.5, color='#f0f0f0', zorder=0)
-ax1.text(2023.5, 0.05, 'vagas via Termos de Adesão ao Sisu', ha='center', fontsize=7.8, color='#595959')
-ax1.set_xticks(anos); ax1.set_ylim(0, 2.0); ax1.set_ylabel('Taxa de ocupação (ingressantes / vagas)')
-ax1.set_title('(a) Ocupação de vagas por ano (oferta-ano)', fontsize=10.5, fontweight='bold')
-ax1.legend(fontsize=8, loc='upper right', frameon=True, facecolor='white', edgecolor='none', framealpha=0.9)
+ax1.text(2023.5, 1.93, 'vagas via Termos\nde Adesão ao Sisu', ha='center', va='top', fontsize=7.8, color='#595959')
+ax1.set_xticks(anos); ax1.set_xticklabels([str(a) for a in anos], rotation=45); ax1.set_ylim(0, 2.0); ax1.set_ylabel('Ocupação (ingressantes / vagas)')
+ax1.set_title('(a) Ocupação por ano (oferta-ano)', fontsize=10.5, fontweight='bold')
+ax1.legend(fontsize=8, loc='upper center', bbox_to_anchor=(0.5, -0.2), ncol=2, frameon=False)
 for mod, gg in of4.groupby('mod_curso'):
     ax2.scatter(gg.ocup_med, gg.taxa_ev * 100, s=34, color=CORES_MOD[mod], alpha=0.8, edgecolor='white', lw=0.6, label=mod)
 coef = np.polyfit(of4.ocup_med, of4.taxa_ev * 100, 1); xs = np.linspace(of4.ocup_med.min(), of4.ocup_med.max(), 50)
 ax2.plot(xs, np.polyval(coef, xs), color='#595959', lw=1.2, ls='--', label='Tendência linear')
 ax2.text(0.97, 0.95, f'Spearman ρ = {rho:.2f} (p < 0,001)\n{len(of4)} ofertas'.replace('.', ','), transform=ax2.transAxes,
          ha='right', va='top', fontsize=8.5)
-ax2.set_xlabel('Taxa de ocupação mediana da oferta'); ax2.set_ylabel('Taxa de evasão acumulada 2016–2025 (%)')
-ax2.set_title('(b) Ocupação de vagas x taxa de evasão, por oferta', fontsize=10.5, fontweight='bold')
+ax2.set_ylim(0, 52); ax2.set_xlabel('Taxa de ocupação mediana da oferta'); ax2.set_ylabel('Taxa de evasão acumulada (%)')
+ax2.set_title('(b) Ocupação e evasão por oferta', fontsize=10.5, fontweight='bold')
 ax2.legend(fontsize=8, loc='upper left', frameon=False)
 for ax in (ax1, ax2):
     for s in ('top', 'right'): ax.spines[s].set_visible(False)
     ax.grid(color='#e6e6e6', lw=0.7, zorder=0)
-fig.tight_layout(); aplicar_br(fig); fig.savefig(f'{PASTA_FIG}/fig_ocupacao_vagas.png', dpi=150, facecolor='white'); plt.show()
+fig.tight_layout(); aplicar_br(fig); fig.savefig(f'{PASTA_FIG}/fig_ocupacao_vagas.png', dpi=200, bbox_inches='tight', facecolor='white'); plt.show()
 """)
 md(r"""
 ### 5.0 Auditoria da série de vagas e sensibilidade à fonte (revisão)
@@ -648,8 +689,9 @@ code(r"""
 # 6.2 Projeção recursiva 2026-2029
 HORIZONTE = [2026, 2027, 2028, 2029]
 base_full = base.dropna(subset=['ingressantes']).copy()
-mapa_f, mg_f = fit_target_encoding(base, 'curso', 'ingressantes')
-full = apply_target_encoding(base_full, 'curso', mapa_f, mg_f, 'curso_enc')
+full = base_full.copy(); full['curso_enc'] = te_temporal(full)[0].values
+# Na projeção, o curso é codificado com o histórico até 2025 (anos < 2026), congelado como as demais variáveis exógenas
+_ref = pd.DataFrame({'curso': sorted(df.curso.unique()), 'ano': 2026}); ENC_2026 = dict(zip(_ref.curso, te_temporal(_ref)[0]))
 full_oh = pd.get_dummies(full, columns=CATEGORICAS, prefix=CATEGORICAS)
 dum_full = [c for c in full_oh.columns if c.startswith(PREFIXOS)]
 COLS_FULL = NUMERICAS_V5 + dum_full
@@ -674,7 +716,7 @@ def projetar(oferta_id):
     nova.update({k: ult[k] for k in ['campus', 'curso', 'mod_curso', 'mod_ensino', 'cod_cine', 'area_cine', 'oferta_id']}); nova['ano'] = int(g.ano.max()) + 1
     ext = add_features(pd.concat([g, pd.DataFrame([nova])], ignore_index=True))
     exog = ext[ext.ano == nova['ano']].iloc[0][EXOG].to_dict()
-    meta = {'enc': mapa_f.get(ult.curso, mg_f),
+    meta = {'enc': ENC_2026[ult.curso],
             'dummies': {f'campus_{ult.campus}': 1, f'mod_curso_{ult.mod_curso}': 1, f'mod_ensino_{ult.mod_ensino}': 1, f'area_cine_{ult.area_cine}': 1}}
     real = {a: v for a, v in zip(g.ano, g.ingressantes) if pd.notna(v)}
     serie, oficial = dict(real), {}
@@ -717,28 +759,33 @@ def grafico_projecao(lista, nrows, ncols, figsize, titulo, arquivo, top, legend_
         ax.grid(axis='y', color='#e0e0e0', lw=0.7); ax.axvline(2025.5, color='#999999', lw=0.8, ls='--')
         ax.axvline(2026.5, color='#bbbbbb', lw=0.8, ls=':')
         ytop = ax.get_ylim()[1]; ax.set_ylim(0, ytop * 1.2)
-        ax.text(2028, ytop * 1.185, '2027-29: exploratório', ha='center', va='top', fontsize=7, color='#808080',
+        ax.text(2028, ytop * 1.185, '2027–29: exploratório', ha='center', va='top', fontsize=7, color='#808080',
                 bbox=dict(facecolor='white', edgecolor='none', pad=1.0), zorder=5)
         for s in ('top', 'right'): ax.spines[s].set_visible(False)
         cv0 = r['traj'][:, 0].std() / r['oficial'][2026] * 100; cv3 = r['traj'][:, -1].std() / r['oficial'][2029] * 100
         linha = f'dispersão relativa: {cv0:.0f}% (2026) → {cv3:.0f}% (2029)'
         e = por_oferta.set_index('oferta_id').erro_pct.get(o)
-        if e is not None and pd.notna(e): linha += f'\nerro no teste oficial 2024-25: {e:.1f}%'
+        if e is not None and pd.notna(e): linha += f'\nerro no teste oficial 2024–25: {e:.1f}%'
         ax.annotate(linha, xy=(0.03, 0.03), xycoords='axes fraction', fontsize=7.5, color='#595959', va='bottom')
-    fig.subplots_adjust(top=top, hspace=0.34, wspace=0.32)
-    livre = 1 - top
+    sobra = axes[len(lista):]
+    if len(sobra):
+        for ax in axes[:len(lista)]: ax.xaxis.set_tick_params(labelbottom=True)
+    aplicar_br(fig, relayout=False)
     h, l = axes[0].get_legend_handles_labels()
-    fig.legend(h, l, loc='center', ncol=legend_ncol, bbox_to_anchor=(0.5, top + livre * 0.28), frameon=False, fontsize=9)
-    fig.text(0.5, top + livre * 0.60, 'Projeção recursiva: cada ano usa a projeção do ano anterior como entrada. O erro cresce com o horizonte (teste retroativo):\n'
-             '2027-2029 são projeções exploratórias. A faixa é a dispersão entre as 300 árvores, não um intervalo de confiança.',
-             ha='center', va='center', fontsize=7.7, color='#595959')
-    fig.text(0.5, top + livre * 0.90, titulo, ha='center', va='center', fontsize=12.5, fontweight='bold')
-    aplicar_br(fig); fig.savefig(f'{PASTA_FIG}/{arquivo}', dpi=170, facecolor='white'); plt.show()
+    if len(sobra):
+        for ax in sobra: ax.axis('off')
+        fig.tight_layout(h_pad=1.2, w_pad=1.2)
+        sobra[0].legend(h, l, loc='center', ncol=1, frameon=False, fontsize=axes[0].title.get_fontsize() * 0.9)
+    else:
+        fig.tight_layout(rect=(0, 0, 1, top), h_pad=1.2, w_pad=1.2)
+        fig.legend(h, l, loc='upper center', ncol=legend_ncol, bbox_to_anchor=(0.5, 1.0), frameon=False,
+                   fontsize=axes[0].title.get_fontsize() * 0.85)
+    fig.savefig(f'{PASTA_FIG}/{arquivo}', dpi=170, facecolor='white'); plt.show()
 
 grafico_projecao(ofertas_aracati, 2, 2, (11.5, 9.2), 'Projeção exploratória de Ingressantes 2026-2029 — Campus Aracati (estudo de caso)',
-                 'fig_previsao_aracati.png', 0.74, 2)
-grafico_projecao(ofertas_melhores, 1, 3, (13.5, 5.4), 'Projeção exploratória de Ingressantes 2026-2029 — Ofertas com Menor Erro no Teste',
-                 'fig_previsao_melhores_ofertas.png', 0.62, 4)
+                 'fig_previsao_aracati.png', 0.90, 2)
+grafico_projecao(ofertas_melhores, 2, 2, (11.5, 9.2), 'Projeção exploratória de Ingressantes 2026-2029 — Ofertas com Menor Erro no Teste',
+                 'fig_previsao_melhores_ofertas.png', 0.80, 2)
 """)
 md(r"""
 ### 6.3 Teste retroativo de horizonte (1 a 4 anos) (revisão)
@@ -804,7 +851,7 @@ for ax, t in [(ax1, '(a) Erro absoluto médio por horizonte'), (ax2, '(b) R² po
     ax.set_title(t, fontsize=10.5, fontweight='bold'); ax.grid(alpha=0.3)
     for s_ in ('top', 'right'): ax.spines[s_].set_visible(False)
 ax1.legend(fontsize=8.5, frameon=False)
-fig.tight_layout(); aplicar_br(fig); fig.savefig(f'{PASTA_FIG}/fig_horizonte.png', dpi=200, facecolor='white'); plt.show()
+fig.tight_layout(); aplicar_br(fig, largura=0.95); fig.savefig(f'{PASTA_FIG}/fig_horizonte.png', dpi=200, facecolor='white'); plt.show()
 """)
 md(r"""
 ## 7. Auditoria de integridade temporal — TCC, Seção 5.5
@@ -826,7 +873,8 @@ md(r"""
 
 Para cada oferta modelada e cada ano $t$: (a) todos os indicadores brutos do próprio ano $t$ são alterados e verifica-se que
 **nenhuma** *feature* do ano $t$ muda; (b) cada indicador de $t-1, \dots, t-4$ é alterado isoladamente para registrar de quais anos
-cada *feature* depende. Por fim, verifica-se que o *target encoding* do curso não muda quando o alvo do conjunto de teste é alterado.
+cada *feature* depende. Por fim, verifica-se que a codificação temporal do curso no ano $t$ não muda quando os ingressantes
+dos anos $t$ em diante são alterados.
 """)
 code(r"""
 RAW = ['ingressantes', 'evasao', 'matriculas_ativas', 'concluintes', 'vagas_ofertadas']
@@ -848,15 +896,19 @@ for oid in base.oferta_id.unique():
 print(f'{testes} pares oferta-ano testados | features do ano t alteradas ao perturbar o próprio ano t: {violacoes}')
 display(pd.DataFrame([{'feature': f, 'depende de': ', '.join(sorted({v for v, _ in depende[f]})),
                        'anos': ', '.join(f't-{k}' for k in sorted({k for _, k in depende[f]}))} for f in FEATS]))
-_, te_a, _ = preparar(treino.copy(), teste.copy()); te_mod = teste.copy(); te_mod['ingressantes'] *= 3
-_, te_b, _ = preparar(treino.copy(), te_mod)
-print('O target encoding do teste muda quando o alvo do teste é alterado?', not np.allclose(te_a.curso_enc, te_b.curso_enc))
+viol_te = 0
+for t in range(2019, 2026):
+    h2 = HIST_TE.copy(); h2.loc[h2.ano >= t, 'ingressantes'] = h2.loc[h2.ano >= t, 'ingressantes'] * 7 + 13
+    d_t = base[base.ano == t]
+    viol_te += int((te_temporal(d_t)[0] - te_temporal(d_t, hist=h2)[0]).abs().gt(1e-12).sum())
+print(f'Linhas com codificação do curso alterada ao perturbar os anos t em diante: {viol_te} de {len(base)}')
+print('Linhas que usaram o fallback (curso sem ano anterior):', sum(te_temporal(base[base.ano == t])[1] for t in range(2019, 2026)))
 """)
 md(r"""
 ## 8. Validação temporal *walk-forward* — TCC, Seção 5.6
 
-Janela expansiva: o treino sempre começa em 2016; o teste é um único ano (2021 a 2025). *Target encoding* e *one-hot*
-são reajustados a cada *fold*, só com os dados de treino daquele *fold*. Esta seção calcula também o Bloco C (seção 11).
+Janela expansiva: o treino sempre começa em 2016; o teste é um único ano (2021 a 2025). As colunas *one-hot* são
+definidas a cada *fold* com os dados de treino; o *target encoding* temporal usa sempre apenas os anos anteriores ao de cada linha. Esta seção calcula também o Bloco C (seção 11).
 """)
 code(r"""
 wf = []
@@ -895,10 +947,10 @@ axes[0].annotate(f'RL 2021: R²={rl:.1f}\n(fora da escala)', xy=(2021, -2.95), x
                  arrowprops=dict(arrowstyle='->', color='#8c8c8c', lw=1))
 axes[1].legend(fontsize=8, loc='lower right')
 fig.suptitle('Validação temporal walk-forward (janela expansiva, 5 folds) — área sombreada = ruptura da Covid-19 (teste = 2021)')
-fig.tight_layout(); aplicar_br(fig); fig.savefig(f'{PASTA_FIG}/fig_walk_forward.png', dpi=200, facecolor='white'); plt.show()
+fig.tight_layout(); aplicar_br(fig); fig.savefig(f'{PASTA_FIG}/fig_walk_forward.png', dpi=200, bbox_inches='tight', facecolor='white'); plt.show()
 """)
 md(r"""
-### 8.1 Referências ingênuas (*baselines*) e tabela por janela (revisão)
+### 8.1 Referências ingênuas (*baselines*) e tabela por janela — TCC, Seção 5.7
 
 Três previsões ingênuas, avaliadas exatamente nas mesmas linhas dos modelos: **persistência** (valor do ano anterior),
 **média móvel de 3 anos** e **média histórica da oferta** (média de todos os anos anteriores). A tabela por janela registra
@@ -961,7 +1013,7 @@ axes[0].annotate('RL 2021: MAE = {:.0f}\n(fora da escala)'.format(wf_b[(wf_b.Alv
 h, l = axes[0].get_legend_handles_labels()
 fig.legend(h, l, loc='lower center', ncol=3, frameon=False, fontsize=9, bbox_to_anchor=(0.5, -0.02))
 fig.suptitle('Walk-forward: erro absoluto médio dos modelos (linhas contínuas) e das referências ingênuas (tracejadas)')
-fig.tight_layout(rect=(0, 0.1, 1, 1)); aplicar_br(fig); fig.savefig(f'{PASTA_FIG}/fig_baselines.png', dpi=200, facecolor='white'); plt.show()
+fig.tight_layout(rect=(0, 0.1, 1, 1)); aplicar_br(fig, rect=(0, 0.14, 1, 1)); fig.savefig(f'{PASTA_FIG}/fig_baselines.png', dpi=200, facecolor='white'); plt.show()
 """)
 md(r"""
 ### 8.2 Incerteza das comparações: *bootstrap* por oferta (revisão)
@@ -990,7 +1042,7 @@ for nome_alvo in ALVOS.values():
 display(pd.DataFrame(boot).round(2))
 """)
 md(r"""
-## 9. Análise detalhada dos erros (Random Forest) — TCC, Seção 5.7
+## 9. Análise detalhada dos erros (Random Forest) — TCC, Seção 5.8
 """)
 code(r"""
 erros = {}
@@ -1006,6 +1058,17 @@ for alvo, nome_alvo in ALVOS.items():
 print('Maiores subestimações de Evasão:')
 display(erros['Evasão'].sort_values('erro').head(3).round(1))
 """)
+md(r"""
+### 9.1 Erro por ano de teste (revisão)
+
+Decompõe o viés do *Random Forest* no teste oficial pelos dois anos de teste.
+""")
+code(r"""
+for nome_alvo, d in erros.items():
+    g = d.groupby('ano').agg(n=('erro', 'size'), real_medio=('real', 'mean'), previsto_medio=('previsto', 'mean'),
+                              erro_medio=('erro', 'mean'), pct_superestimacoes=('erro', lambda s: (s > 0).mean() * 100))
+    print(nome_alvo); display(g.round(1))
+""")
 code(r"""
 fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
 for ax, (nome_alvo, d) in zip(axes, erros.items()):
@@ -1018,7 +1081,7 @@ for ax, (nome_alvo, d) in zip(axes, erros.items()):
     for s in ('top', 'right'): ax.spines[s].set_visible(False)
 axes[0].set_ylabel('Erro % mediano (previsto − real)')
 fig.suptitle('Compressão das previsões em direção aos valores centrais (Random Forest) — erro % mediano por faixa de tamanho')
-fig.tight_layout(); aplicar_br(fig); fig.savefig(f'{PASTA_FIG}/fig_vies_regressao_media.png', dpi=200, facecolor='white'); plt.show()
+fig.tight_layout(); aplicar_br(fig, largura=0.85); fig.savefig(f'{PASTA_FIG}/fig_vies_regressao_media.png', dpi=200, facecolor='white'); plt.show()
 
 fig, axes = plt.subplots(1, 2, figsize=(11, 4.8))
 for ax, (nome_alvo, d) in zip(axes, erros.items()):
@@ -1028,12 +1091,12 @@ for ax, (nome_alvo, d) in zip(axes, erros.items()):
     ax.set_xlim(0, lim); ax.set_ylim(0, lim); ax.set_aspect('equal')
     ax.set_title(nome_alvo); ax.set_xlabel('Valor real'); ax.set_ylabel('Valor previsto')
     for s in ('top', 'right'): ax.spines[s].set_visible(False)
-axes[0].legend(fontsize=8)
+axes[0].legend(fontsize=8, loc='lower left')
 fig.suptitle('Random Forest — real vs. previsto no conjunto de teste (2024–2025)')
-fig.tight_layout(); aplicar_br(fig); fig.savefig(f'{PASTA_FIG}/fig_real_vs_previsto.png', dpi=200, facecolor='white'); plt.show()
+fig.tight_layout(); aplicar_br(fig, largura=0.85); fig.savefig(f'{PASTA_FIG}/fig_real_vs_previsto.png', dpi=200, facecolor='white'); plt.show()
 """)
 md(r"""
-## 10. Ablação de blocos de *features* — TCC, Seção 5.8
+## 10. Ablação de blocos de *features* — TCC, Seção 5.9
 
 Blocos aninhados: A (histórico de ingressantes, 4) ⊂ B (+ vagas, 7) ⊂ C (+ indicadores acadêmicos, 15) ⊂ D (+ ano,
 curso e categóricas, 56 = V5). Os valores da coluna "vagas originais" da seção 5.1 são os mesmos desta tabela.
@@ -1055,7 +1118,24 @@ fig.suptitle('Ablação de blocos de features — R² no conjunto de teste (2024
 fig.tight_layout(); aplicar_br(fig); fig.savefig(f'{PASTA_FIG}/fig_ablacao.png', dpi=200, facecolor='white'); plt.show()
 """)
 md(r"""
-## 11. *Walk-forward* do Bloco C — TCC, Seção 5.9
+### 10.1 O que diferencia o Bloco C do Bloco D (revisão)
+
+O Bloco D acrescenta três coisas ao Bloco C: a variável `ano`, a codificação do curso (`curso_enc`) e as colunas *one-hot*.
+Esta célula acrescenta cada componente separadamente ao Bloco C (e retira `ano` do Bloco D), no teste oficial 2024–2025.
+""")
+code(r"""
+CONJ = {'C': BLOCO_C, 'C + ano': BLOCO_C + ['ano'], 'C + curso_enc': BLOCO_C + ['curso_enc'], 'C + one-hot': BLOCO_C + DUMMIES,
+        'D sem ano': BLOCO_C + ['curso_enc'] + DUMMIES, 'D (V5)': BLOCO_C + ['ano', 'curso_enc'] + DUMMIES}
+dec = []
+for alvo, nome_alvo in ALVOS.items():
+    for rot, cols in CONJ.items():
+        for nome, m in modelos().items():
+            a_te, p, _, _ = ajustar_prever(m, TR, TE, cols, alvo)
+            dec.append({'Alvo': nome_alvo, 'Modelo': nome, 'Conjunto': rot, 'R²': r2_score(a_te[alvo], p)})
+display(pd.DataFrame(dec).pivot_table(index=['Alvo', 'Modelo'], columns='Conjunto', values='R²', sort=False)[list(CONJ)].round(3))
+""")
+md(r"""
+## 11. *Walk-forward* do Bloco C — TCC, Seção 5.10
 """)
 code(r"""
 rc, rd = resumo(wf[wf.Bloco == 'C']), resumo(wfD)
@@ -1067,7 +1147,7 @@ display(tab14.round(3))
 print('Bloco C, R² médio nos 5 folds (inclui 2021):'); display(rc['R² médio'].round(3))
 """)
 md(r"""
-## 12. Teste exploratório: matrícula trancada — TCC, Seção 5.10
+## 12. Teste exploratório: matrícula trancada — TCC, Apêndice B
 
 O indicador "Matrícula (trancada)" foi coletado no painel *IFCE em Números* e está em `Banco de Dados.xlsx`
 (linhas com Tipo = "Matrícula trancada"). Ele é usado apenas neste teste: as seções anteriores não dependem dele.
@@ -1088,7 +1168,7 @@ for ano_teste in range(2021, 2026):
             a_te, p, _, _ = ajustar_prever(m, tr, te, cols, 'evasao')
             linhas.append({'Modelo': nome, 'Versão': rotulo, 'Ano de teste': ano_teste, 'R²': r2_score(a_te.evasao, p)})
 lt = pd.DataFrame(linhas)
-print('R² médio para Evasão (walk-forward, excluindo 2021) — Tabela da Seção 5.10')
+print('R² médio para Evasão (walk-forward, excluindo 2021) — Tabela do Apêndice B')
 tab_tr = lt[lt['Ano de teste'] != 2021].pivot_table(index='Modelo', columns='Versão', values='R²')[['sem trancada', 'com trancada']]
 tab_tr['Δ'] = tab_tr['com trancada'] - tab_tr['sem trancada']
 display(tab_tr.round(3))
@@ -1133,17 +1213,16 @@ for ax, nome_alvo, cor in zip(axes, ALVOS.values(), ['#2c7fb8', '#d95f02']):
     ax.set_title(nome_alvo); ax.set_xlabel('Média de |valor SHAP|')
     for sp in ('top', 'right'): ax.spines[sp].set_visible(False)
 fig.suptitle('Importância global das features (Random Forest) — top 12 por |SHAP| médio')
-fig.tight_layout(); aplicar_br(fig); fig.savefig(f'{PASTA_FIG}/fig_shap_importancia.png', dpi=200, facecolor='white'); plt.show()
+fig.tight_layout(); aplicar_br(fig); fig.savefig(f'{PASTA_FIG}/fig_shap_importancia.png', dpi=200, bbox_inches='tight', facecolor='white'); plt.show()
 
 plt.figure()
 shap.summary_plot(shap_rf_evasao, X_shap.rename(columns=nome_legivel), max_display=12, show=False)
-plt.title('SHAP — Random Forest, Evasão (conjunto de teste 2024–2025)', fontsize=11)
 _f = plt.gcf()
 _f.axes[0].set_xlabel('Valor SHAP (impacto na previsão do modelo)')
 if len(_f.axes) > 1:
     _cb = _f.axes[-1]; _cb.set_ylabel('Valor da feature')
     _cb.set_yticks(_cb.get_yticks()); _cb.set_yticklabels(['Baixo' if l.get_text() == 'Low' else 'Alto' if l.get_text() == 'High' else l.get_text() for l in _cb.get_yticklabels()])
-aplicar_br(_f)
+aplicar_br(_f, largura=0.85, relayout=False)
 plt.savefig(f'{PASTA_FIG}/fig_shap_beeswarm_evasao.png', dpi=200, bbox_inches='tight', facecolor='white'); plt.show()
 """)
 md(r"""
@@ -1165,7 +1244,176 @@ for rotulo, cols in [('Ordem da Tabela V5 / ablação / SHAP', ORDEM_TABELA), ('
 display(pd.DataFrame(comp).pivot_table(index=['Alvo', 'Modelo'], columns='Ordem', values='R²', sort=False).round(3))
 """)
 md(r"""
-## 15. Download das figuras
+## 15. Testes complementares — TCC, Apêndice C
+
+### 15.1 Evasão como taxa, e não como contagem
+
+No TCC, a evasão é modelada como **número de matrículas evadidas** por oferta e ano. Esta seção repete a avaliação com a
+**taxa de evasão** do mesmo ano (evasão / matrículas ativas, em %) como alvo, com as mesmas 56 *features*, o mesmo teste oficial
+(2024–2025) e a mesma *walk-forward* (2022–2025). As referências ingênuas são a taxa do ano anterior (persistência), a média das
+taxas dos três anos anteriores e a taxa histórica acumulada da oferta (`taxa_evasao_hist`, soma das evasões sobre soma das
+matrículas de todos os anos anteriores). O objetivo é verificar se a conclusão sobre a baixa previsibilidade da evasão depende
+da escolha do alvo.
+""")
+code(r"""
+def com_taxa(d):
+    d = d.copy()
+    d['taxa_ev'] = np.where(d.matriculas_ativas > 0, d.evasao / d.matriculas_ativas * 100, np.nan)
+    return d
+tx = com_taxa(df).sort_values(['oferta_id', 'ano'])
+tx['taxa_ev_lag1'] = tx.groupby('oferta_id').taxa_ev.shift(1)
+tx['taxa_ev_ma3'] = tx.groupby('oferta_id').taxa_ev.transform(lambda s: s.shift(1).rolling(3, min_periods=3).mean())
+base_t = com_taxa(base).merge(tx[['oferta_id', 'ano', 'taxa_ev_lag1', 'taxa_ev_ma3']], on=['oferta_id', 'ano'], how='left')
+base_t['taxa_ev_hist'] = base_t.taxa_evasao_hist * 100
+REF_TAXA = {'Persistência (ano anterior)': 'taxa_ev_lag1', 'Média móvel 3 anos': 'taxa_ev_ma3', 'Taxa histórica da oferta': 'taxa_ev_hist'}
+
+def avaliar_taxa(tr_rows, te_rows, cols_fn):
+    tr, te, dum = preparar(tr_rows.copy(), te_rows.copy()); ref = te.dropna(subset=['taxa_ev'])
+    pl = ref[['oferta_id', 'ano', 'taxa_ev']].rename(columns={'taxa_ev': 'real'}); linhas = []
+    for nome, m in modelos().items():
+        a_te, p, _, _ = ajustar_prever(m, tr, te, cols_fn(dum), 'taxa_ev'); pl[nome] = pd.Series(p, index=a_te.index)
+        linhas.append({'Método': nome, 'n': len(a_te), **metricas(a_te.taxa_ev, p)})
+    for nome, col in REF_TAXA.items():
+        ok = ref[col].notna(); pl[nome] = ref[col]
+        linhas.append({'Método': nome, 'n': int(ok.sum()), **metricas(ref.loc[ok, 'taxa_ev'], ref.loc[ok, col])})
+    return pd.DataFrame(linhas), pl
+
+of_t, prev_of_t = avaliar_taxa(base_t[base_t.ano <= ANO_CORTE], base_t[base_t.ano > ANO_CORTE], lambda dum: ORDEM_TABELA)
+print('Taxa de evasão (%) — teste oficial 2024-2025'); display(of_t.round(3))
+wf_t, prev_wf_t = [], []
+for ano_teste in range(2022, 2026):
+    r, pl = avaliar_taxa(base_t[base_t.ano <= ano_teste - 1], base_t[base_t.ano == ano_teste], lambda dum: NUMERICAS_V5 + dum)
+    r['Ano de teste'] = ano_teste; wf_t.append(r); prev_wf_t.append(pl)
+wf_t = pd.concat(wf_t); prev_wf_t = pd.concat(prev_wf_t)
+t = wf_t.pivot_table(index='Método', columns='Ano de teste', values='R²', sort=False)
+t['R² médio 2022-2025'] = t.mean(axis=1)
+t['MAE médio 2022-2025'] = wf_t.pivot_table(index='Método', columns='Ano de teste', values='MAE', sort=False).mean(axis=1)
+print('Taxa de evasão (%) — walk-forward 2022-2025'); display(t.round(3))
+bt = []
+for rot, d in [('Teste oficial 2024-2025', prev_of_t), ('Walk-forward 2022-2025', prev_wf_t)]:
+    for a, b in [('Random Forest', 'Taxa histórica da oferta'), ('Regressão Linear', 'Taxa histórica da oferta'),
+                 ('XGBoost', 'Taxa histórica da oferta'), ('Random Forest', 'Persistência (ano anterior)')]:
+        o_, lo, hi, n, no = dif_mae(d, a, b)
+        bt.append({'Avaliação': rot, 'Comparação': f'{a} - {b}', 'Dif. MAE (p.p.)': o_, 'IC95% inf.': lo, 'IC95% sup.': hi, 'n': n, 'ofertas': no})
+print('Diferenças de MAE (pontos percentuais), bootstrap por oferta'); display(pd.DataFrame(bt).round(2))
+""")
+
+md(r"""
+### 15.2 *Target encoding* do curso: três estratégias
+
+O curso é a única variável cuja codificação depende do alvo. Esta seção compara três formas de calculá-la, mantendo todo o
+resto igual (população, *features*, hiperparâmetros, teste oficial 2024–2025 e *walk-forward* 2021–2025):
+
+1. **Original** (versão anterior do *pipeline*): média suavizada de ingressantes por curso, calculada com **todas** as linhas de treino e
+   aplicada ao teste. O teste nunca entra no cálculo, mas cada linha de treino é codificada com o próprio alvo e com os alvos de
+   anos posteriores dentro do treino.
+2. ***K-fold* fora da amostra** (5 partes aleatórias, semente 42): cada linha de treino é codificada com as outras quatro partes.
+   Retira o próprio alvo, mas ainda usa anos posteriores dentro do treino.
+3. **Temporal**: a linha da oferta no ano $t$ é codificada só com os ingressantes do mesmo curso nos anos **anteriores a $t$**,
+   nas ofertas da população modelada (a partir de 2016). Suavização 10 em direção à média geral desses mesmos anos anteriores;
+   curso sem nenhum ano anterior recebe a média geral (*fallback*). A regra é a mesma para treino e teste, como nas defasagens:
+   a linha de 2025 usa os anos até 2024, que já são conhecidos no início de 2025.
+
+Todas usam ingressantes como alvo da codificação (para os dois modelos). A estratégia **temporal é a do *pipeline* principal**
+desde a revisão de banca; as outras duas são mantidas aqui para documentar a mudança.
+""")
+code(r"""
+# Estratégia 2 (K-fold fora da amostra), usada na comparação da seção 15.2
+from sklearn.model_selection import KFold
+def preparar_oof(treino, teste, k=5):
+    tr, te, dum = preparar_original(treino, teste)
+    oof = pd.Series(np.nan, index=tr.index)
+    for i_fit, i_enc in KFold(k, shuffle=True, random_state=42).split(tr):
+        parte = tr.iloc[i_fit]; mapa, mg = fit_target_encoding(parte, 'curso', 'ingressantes')
+        oof.iloc[i_enc] = tr.iloc[i_enc]['curso'].map(mapa).fillna(mg).values
+    tr = tr.copy(); tr['curso_enc'] = oof.values
+    return tr, te, dum
+""")
+code(r"""
+ESTRATEGIAS = {'Original': preparar_original, 'K-fold fora da amostra': preparar_oof, 'Temporal': preparar}
+for rot, prep in ESTRATEGIAS.items():
+    tr_, te_, _ = prep(treino, teste)
+    a, b = tr_.dropna(subset=['ingressantes']), te_.dropna(subset=['ingressantes'])
+    print(f'{rot}: correlação curso_enc x ingressantes — treino {a.curso_enc.corr(a.ingressantes):.3f} | teste {b.curso_enc.corr(b.ingressantes):.3f}')
+""")
+code(r"""
+def avaliar_prep(tr_rows, te_rows, prep, cols_fn, rotulo):
+    tr, te, dum = prep(tr_rows.copy(), te_rows.copy()); linhas, prevs = [], []
+    for alvo, nome_alvo in ALVOS.items():
+        ref = te.dropna(subset=[alvo]); pl = ref[['oferta_id', 'ano', alvo]].rename(columns={alvo: 'real'}).assign(Alvo=nome_alvo, corte=rotulo)
+        for nome, m in modelos().items():
+            a_te, p, _, _ = ajustar_prever(m, tr, te, cols_fn(dum), alvo); pl[nome] = pd.Series(p, index=a_te.index)
+            linhas.append({'Alvo': nome_alvo, 'Método': nome, **metricas(a_te[alvo], p)})
+        for nome, padrao in BASELINES.items():
+            prev = ref[padrao.format(alvo)]; ok = prev.notna(); pl[nome] = prev
+            linhas.append({'Alvo': nome_alvo, 'Método': nome, **metricas(ref.loc[ok, alvo], prev[ok])})
+        prevs.append(pl)
+    return pd.DataFrame(linhas), pd.concat(prevs)
+
+comp_of, comp_wf, prev_te = [], [], {}
+for rot, prep in ESTRATEGIAS.items():
+    r, pl = avaliar_prep(base_b[base_b.ano <= ANO_CORTE], base_b[base_b.ano > ANO_CORTE], prep, lambda dum: ORDEM_TABELA, 'oficial')
+    comp_of.append(r.assign(Estratégia=rot)); prev_te[(rot, 'oficial')] = pl
+    for ano_teste in range(2021, 2026):
+        r, pl = avaliar_prep(base_b[base_b.ano <= ano_teste - 1], base_b[base_b.ano == ano_teste], prep, lambda dum: NUMERICAS_V5 + dum, f'wf{ano_teste}')
+        comp_wf.append(r.assign(Estratégia=rot, **{'Ano de teste': ano_teste})); prev_te[(rot, ano_teste)] = pl
+comp_of, comp_wf = pd.concat(comp_of), pd.concat(comp_wf)
+MODS = list(modelos())
+print('Teste oficial 2024-2025 (Bloco D): RMSE, MAE e R² por estratégia')
+display(comp_of[comp_of.Método.isin(MODS)].pivot_table(index=['Alvo', 'Método'], columns='Estratégia', values=['RMSE', 'MAE', 'R²'], sort=False)
+        .reindex(columns=list(ESTRATEGIAS), level=1).round(3))
+print('Referências ingênuas no teste oficial (não dependem da codificação)')
+display(comp_of[~comp_of.Método.isin(MODS) & (comp_of.Estratégia == 'Original')][['Alvo', 'Método', 'RMSE', 'MAE', 'R²']].round(3))
+g5 = comp_wf.groupby(['Alvo', 'Método', 'Estratégia'], sort=False)
+gx = comp_wf[comp_wf['Ano de teste'] != 2021].groupby(['Alvo', 'Método', 'Estratégia'], sort=False)
+wf_res = pd.DataFrame({'R² médio (5 folds)': g5['R²'].mean(), 'R² médio (excl. 2021)': gx['R²'].mean(),
+                       'MAE médio (excl. 2021)': gx['MAE'].mean(), 'RMSE médio (excl. 2021)': gx['RMSE'].mean()}).reset_index()
+print('Walk-forward (Bloco D): médias por estratégia')
+display(wf_res[wf_res.Método.isin(MODS)].pivot_table(index=['Alvo', 'Método'], columns='Estratégia',
+        values=['R² médio (5 folds)', 'R² médio (excl. 2021)', 'MAE médio (excl. 2021)'], sort=False).reindex(columns=list(ESTRATEGIAS), level=1).round(3))
+print('Referências ingênuas na walk-forward (excl. 2021)')
+display(wf_res[~wf_res.Método.isin(MODS) & (wf_res.Estratégia == 'Original')][['Alvo', 'Método', 'R² médio (excl. 2021)', 'MAE médio (excl. 2021)']].round(3))
+""")
+code(r"""
+bt_te = []
+for rot in ESTRATEGIAS:
+    for aval, d in [('Teste oficial 2024-2025', prev_te[(rot, 'oficial')]),
+                    ('Walk-forward 2022-2025', pd.concat([prev_te[(rot, a)] for a in range(2022, 2026)]))]:
+        for nome_alvo in ALVOS.values():
+            for a, b in COMPARACOES:
+                o_, lo, hi, n, no = dif_mae(d[d.Alvo == nome_alvo], a, b)
+                bt_te.append({'Estratégia': rot, 'Alvo': nome_alvo, 'Avaliação': aval, 'Comparação': f'{a} - {b}',
+                              'Dif. MAE': o_, 'IC95% inf.': lo, 'IC95% sup.': hi})
+bt_te = pd.DataFrame(bt_te)
+print('Diferenças de MAE com IC95% (bootstrap por oferta) por estratégia de codificação')
+display(bt_te.pivot_table(index=['Alvo', 'Avaliação', 'Comparação'], columns='Estratégia', values=['Dif. MAE', 'IC95% inf.', 'IC95% sup.'], sort=False)
+        .reindex(columns=list(ESTRATEGIAS), level=1).round(2))
+""")
+code(r"""
+TRo_, TEo_, _ = preparar_original(treino, teste)
+dt = []
+for alvo, nome_alvo in ALVOS.items():
+    for rot, cols in CONJ.items():
+        for nome, m in modelos().items():
+            a_te, p, _, _ = ajustar_prever(m, TRo_, TEo_, cols, alvo)
+            dt.append({'Alvo': nome_alvo, 'Modelo': nome, 'Conjunto': rot, 'R²': r2_score(a_te[alvo], p)})
+print('Decomposição C -> D no teste oficial com a codificação ORIGINAL (a seção 10.1 usa a temporal)')
+display(pd.DataFrame(dt).pivot_table(index=['Alvo', 'Modelo'], columns='Conjunto', values='R²', sort=False)[list(CONJ)].round(3))
+
+imp_t = {}
+for alvo, nome_alvo in ALVOS.items():
+    for nome in ['Random Forest', 'XGBoost']:
+        a_te, _, m, Xte = ajustar_prever(modelos()[nome], TRo_, TEo_, ORDEM_TABELA, alvo)
+        imp_t[(nome_alvo, nome)] = pd.Series(np.abs(shap.TreeExplainer(m).shap_values(Xte)).mean(0), index=ORDEM_TABELA)
+imp_t = pd.DataFrame(imp_t)
+print('SHAP com a codificação ORIGINAL (a seção 13 usa a temporal): média de |SHAP| das 6 maiores features')
+for c in imp_t.columns:
+    s = imp_t[c].sort_values(ascending=False)
+    print(f'{c[0]} / {c[1]}:', ', '.join(f'{nome_legivel(k)} {v:.2f}' for k, v in s.head(6).items()),
+          f'| posição do curso codificado: {list(s.index).index("curso_enc") + 1}')
+""")
+md(r"""
+## 16. Download das figuras
 """)
 code(r"""
 with zipfile.ZipFile('figuras_tcc.zip', 'w') as z:
